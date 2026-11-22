@@ -1,0 +1,80 @@
+diff --git a/reply.py b/reply.py
+--- a/reply.py
++++ b/reply.py
+@@ -937,6 +937,19 @@
+         except Exception:
+             continue
+     return out
++
++
++def ocr_chat_title(img, geom, ctx):
++    """Read the WeChat header as a single line on light or dark themes."""
++    ctx.check()
++    gray = np.asarray(img.crop(geom["header"]).convert("L"))
++    if min(gray.shape) < 8:
++        return ""
++    if np.median(gray) < 128:
++        gray = cv2.bitwise_not(gray)
++    scaled = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
++    bordered = cv2.copyMakeBorder(scaled, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
++    return watcher._tess_run(bordered, 7, tesseract_bin(), "chi_sim", 8000)
+ 
+ 
+ def name_match_region(img, box, target, ctx, match_cfg, max_plans=2):
+@@ -3519,7 +3532,7 @@
+         log_stage("read-guard", "busy -> 不动作直接退出（reason=%s）" % guard.get("reason"))
+         print(json.dumps({"ok": False, "skip": "busy", "reason": guard.get("reason"),
+                           "detail": guard.get("detail"), "chat": target}, ensure_ascii=False))
+-        return 0
++        return 1
+     log_stage("read-guard", "通过（只读判断，未注入任何输入）")
+     clip = Clip()
+     hwnd = None
+@@ -3536,12 +3549,25 @@
+         ctx.sleep(0.15)
+         img_cur = capture_window(ctx, hwnd)
+         geom_cur = geom_of(img_cur, scale)
+-        opened = False
++        target_name = _clean_row_text(target)
++        title = ocr_chat_title(img_cur, geom_cur, ctx)
++        opened = bool(target_name) and _split_group_title(title)[0] == target_name
++        if not opened:
++            # The list divider can drift on a maximized window. Read the usual title
++            # area separately, and require an exact title before reading messages.
++            _, top, right, bottom = geom_cur["header"]
++            left = round((watcher.GEOM["rail_w"] + watcher.GEOM["list_w"] - 2) * scale)
++            narrow_header = (left, top, min(right, left + round(195 * scale)), bottom)
++            if narrow_header[2] > narrow_header[0]:
++                title = ocr_chat_title(img_cur, {"header": narrow_header}, ctx)
++                opened = bool(target_name) and _split_group_title(title)[0] == target_name
++        if opened:
++            log_stage("read-search", "当前会话标题精确匹配 %r，直接读取" % target)
+         detail = ""
+-        for attempt in range(1, 3):
++        attempts = () if opened else (1, 2)
++        for attempt in attempts:
+             ctx.checkpoint("搜索前" if attempt == 1 else "重新搜索前")
+             if attempt > 1:
+-                esc_if_search_confirmed(ctx, "第 %d 次搜索前收尾上一次" % attempt)
+                 ctx.sleep(0.1)
+                 ctx.mark_search_open(False)
+                 img_cur = capture_window(ctx, hwnd)
+@@ -3580,17 +3606,13 @@
+         log("abort(read-msg): %s" % exc)
+         print(json.dumps({"ok": False, "skip": str(exc), "chat": target,
+                           "elapsed": round(ctx.elapsed(), 2)}, ensure_ascii=False))
+-        return 0
++        return 1
+     except Exception as exc:
+         log_error("read-msg 未捕获异常", exc)
+         print(json.dumps({"ok": False, "error": "%s: %s" % (type(exc).__name__, exc),
+                           "chat": target}, ensure_ascii=False))
+         return 1
+     finally:
+-        try:
+-            esc_if_search_confirmed(ctx, "read-msg 收尾")
+-        except Exception:
+-            pass
+         disarm_injection_guard()
+ 
+ 
