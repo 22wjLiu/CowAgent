@@ -1,7 +1,7 @@
 diff --git a/reply.py b/reply.py
 --- a/reply.py
 +++ b/reply.py
-@@ -937,6 +937,19 @@
+@@ -937,6 +937,40 @@
          except Exception:
              continue
      return out
@@ -18,10 +18,141 @@ diff --git a/reply.py b/reply.py
 +    scaled = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
 +    bordered = cv2.copyMakeBorder(scaled, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
 +    return watcher._tess_run(bordered, 7, tesseract_bin(), "chi_sim", 8000)
++
++
++def exact_chat_title(img, geom, ctx, target):
++    """Return the title only when it identifies the requested chat exactly."""
++    target_name = _clean_row_text(target)
++    if not target_name:
++        return ""
++    title = ocr_chat_title(img, geom, ctx)
++    if _split_group_title(title)[0] == target_name:
++        return title
++
++    # The list divider can drift on a maximized window. Recheck the usual title
++    # area without accepting an approximate match.
++    _, top, right, bottom = geom["header"]
++    scale = geom["s"]
++    left = round((watcher.GEOM["rail_w"] + watcher.GEOM["list_w"] - 2) * scale)
++    narrow_header = (left, top, min(right, left + round(195 * scale)), bottom)
++    if narrow_header[2] <= narrow_header[0]:
++        return ""
++    title = ocr_chat_title(img, {"header": narrow_header}, ctx)
++    return title if _split_group_title(title)[0] == target_name else ""
  
  
  def name_match_region(img, box, target, ctx, match_cfg, max_plans=2):
-@@ -3519,7 +3532,7 @@
+@@ -2142,6 +2176,69 @@
+     return analysis2
+ 
+ 
++LOCAL_CHAT_SECTIONS = {"群聊", "联系人", "最常使用", "最近使用"}
++SEARCH_RESULT_BOUNDARIES = ("更多", "搜索网络结果", "网络查找微信号")
++
++
++def select_exact_local_result(rows, target_name):
++    """Select a unique exact name before the dropdown's network results."""
++    section = ""
++    matches = []
++    for row in rows:
++        # The union variant is synthetic and may create a name not present in OCR.
++        words = {
++            _clean_row_text(text)
++            for source, text in row["src_texts"].items()
++            if source != "union"
++        }
++        if any(marker in word for marker in SEARCH_RESULT_BOUNDARIES for word in words):
++            break
++        headers = words.intersection(GROUP_HEADERS)
++        if headers:
++            section = next(iter(headers)) if len(headers) == 1 else ""
++            continue
++        if section in LOCAL_CHAT_SECTIONS and target_name in words:
++            matches.append((row, section))
++    else:
++        # The scan must reach the end of local results to check uniqueness.
++        return None
++    if len(matches) > 1:
++        raise ReplyAbort("row-ambiguous（本地搜索结果里有多个同名会话，未点击）")
++    return matches[0] if matches else None
++
++
++def find_exact_local_result(ctx, img, geom, target):
++    """Read the stable left-hand dropdown separately from the chat pane."""
++    target_name = _clean_row_text(target)
++    if not target_name:
++        return None
++    scale = geom["s"]
++    left = round((watcher.GEOM["rail_w"] + 11) * scale)
++    top = round(watcher.GEOM["rows_top"] * scale)
++    right = min(img.width, round((watcher.GEOM["rail_w"] + watcher.GEOM["list_w"] + 3) * scale))
++    bottom = min(img.height, top + round(310 * scale))
++    if right - left < 40 or bottom - top < 40:
++        return None
++    box = (left, top, right, bottom)
++    dark_background = bool(np.median(np.asarray(img.crop(box).convert("L"))) < 128)
++    rows = _ocr_rows(img, box, ctx, zoom=3, psms=(6, 11),
++                     include_orig=False, invert=dark_background)
++    match = select_exact_local_result(rows, target_name)
++    if match is None:
++        return None
++    row, section = match
++    log("  [下拉] 本地分区 %r 唯一精确匹配 %r" % (section, target))
++    return {
++        "text": target,
++        "section": section,
++        "x_click": min(right - 8, left + round(80 * scale)),
++        "y_click": round(row["y"]),
++        "img_ref": img,
++        "panel_box": box,
++        "row_box": (left, round(row["top"]), right, round(row["bottom"])),
++    }
++
++
+ def find_conversation_row(ctx, img, geom, target):
+     """在搜索下拉面板里定位「真正的会话行」并返回点击坐标（2026-10-26 精度改造版）。
+ 
+@@ -2425,7 +2522,7 @@
+     return True, img_a
+ 
+ 
+-def do_open_chat(ctx, hwnd, target, match_cfg, attempt, clip):
++def do_open_chat(ctx, hwnd, target, match_cfg, attempt, clip, *, read_only=False):
+     """在已打开的搜索层里：输入联系人名 -> OCR 搜索下拉面板定位「真正的会话行」
+     -> 受控单击该行 -> 校验聊天标题 == 目标会话名。
+ 
+@@ -2454,7 +2551,9 @@
+         img_screen = capture_screen_window(ctx, hwnd)   # 屏幕截图：能抓到下拉 popup
+         shot = save_img(img_screen, "dropdown")
+         log("  下拉面板屏幕截图(%s): %s" % (way_label, shot))
+-        row = find_conversation_row(ctx, img_screen, geom_w, target)
++        row = find_exact_local_result(ctx, img_screen, geom_w, target) if read_only else None
++        if row is None:
++            row = find_conversation_row(ctx, img_screen, geom_w, target)
+         if not row:
+             # 辅助告警（不是硬闸门）：搜索框 OCR 只用来区分「没输进去」还是「下拉没弹」
+             try:
+@@ -2470,6 +2569,19 @@
+         ctx.sleep(0.6)   # 等会话切换 + 标题栏刷新
+         img_after = capture_window(ctx, hwnd)
+         geom_after = geom_of(img_after, scale)
++        if read_only:
++            # A click may have closed the dropdown, even when the new title fails.
++            ctx.mark_search_open(False)
++            title = exact_chat_title(img_after, geom_after, ctx, target)
++            if not title:
++                ctx.sleep(0.45)
++                img_after = capture_window(ctx, hwnd)
++                geom_after = geom_of(img_after, scale)
++                title = exact_chat_title(img_after, geom_after, ctx, target)
++            if not title or (row.get("section") == "联系人" and _split_group_title(title)[1]):
++                raise ReplyAbort("post-click-validation-failed（只读：点开后的会话标题不匹配）")
++            log("  [只读校验] 点开后标题精确匹配: %r" % title)
++            return True, img_after, geom_after, title
+         # 🔴 点完只做三重校验（标题 exact / 群聊-私聊 / 输入框为空）；任一不过立即 abort，
+         #    绝不再点第二次去找补（用户要求：宁可 abort 不发送，也不能点进错会话）。
+         ok_v, detail_v = validate_opened_chat(
+@@ -3519,7 +3631,7 @@
          log_stage("read-guard", "busy -> 不动作直接退出（reason=%s）" % guard.get("reason"))
          print(json.dumps({"ok": False, "skip": "busy", "reason": guard.get("reason"),
                            "detail": guard.get("detail"), "chat": target}, ensure_ascii=False))
@@ -30,23 +161,12 @@ diff --git a/reply.py b/reply.py
      log_stage("read-guard", "通过（只读判断，未注入任何输入）")
      clip = Clip()
      hwnd = None
-@@ -3536,12 +3549,25 @@
+@@ -3536,12 +3648,14 @@
          ctx.sleep(0.15)
          img_cur = capture_window(ctx, hwnd)
          geom_cur = geom_of(img_cur, scale)
 -        opened = False
-+        target_name = _clean_row_text(target)
-+        title = ocr_chat_title(img_cur, geom_cur, ctx)
-+        opened = bool(target_name) and _split_group_title(title)[0] == target_name
-+        if not opened:
-+            # The list divider can drift on a maximized window. Read the usual title
-+            # area separately, and require an exact title before reading messages.
-+            _, top, right, bottom = geom_cur["header"]
-+            left = round((watcher.GEOM["rail_w"] + watcher.GEOM["list_w"] - 2) * scale)
-+            narrow_header = (left, top, min(right, left + round(195 * scale)), bottom)
-+            if narrow_header[2] > narrow_header[0]:
-+                title = ocr_chat_title(img_cur, {"header": narrow_header}, ctx)
-+                opened = bool(target_name) and _split_group_title(title)[0] == target_name
++        opened = bool(exact_chat_title(img_cur, geom_cur, ctx, target))
 +        if opened:
 +            log_stage("read-search", "当前会话标题精确匹配 %r，直接读取" % target)
          detail = ""
@@ -59,7 +179,16 @@ diff --git a/reply.py b/reply.py
                  ctx.sleep(0.1)
                  ctx.mark_search_open(False)
                  img_cur = capture_window(ctx, hwnd)
-@@ -3580,17 +3606,13 @@
+@@ -3553,7 +3667,7 @@
+             if not ok_search:
+                 raise ReplyAbort("search-not-opened（只读模式：未输入任何字符、未发送）")
+             opened, _confirmed, img, geom, detail = do_open_chat(
+-                ctx, hwnd, target, match_cfg, attempt, clip)
++                ctx, hwnd, target, match_cfg, attempt, clip, read_only=True)
+             if opened:
+                 break
+             log_stage("read-search", "第 %d 次打开失败: %s" % (attempt, detail))
+@@ -3580,17 +3694,13 @@
          log("abort(read-msg): %s" % exc)
          print(json.dumps({"ok": False, "skip": str(exc), "chat": target,
                            "elapsed": round(ctx.elapsed(), 2)}, ensure_ascii=False))
