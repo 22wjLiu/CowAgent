@@ -35,3 +35,4 @@ CowAgent 是一个可通过 Web、桌面端、移动端及即时通信渠道使�
 | [docs/ai/repos-and-commands.md](docs/ai/repos-and-commands.md) | 安装依赖、启动服务、运行测试、构建客户端或预览文档站时，查运行时、工作目录与命令。 |
 | [docs/ai/backend-runtime.md](docs/ai/backend-runtime.md) | 改渠道启动、Agent 路由、模型或工具执行、配置、会话持久化或工作区路径时。 |
 | [docs/ai/clients-and-api.md](docs/ai/clients-and-api.md) | 改 Web API、鉴权、聊天流，或桌面端与移动端的客户端、内嵌后端和打包资源时。 |
+| [docs/ai/weixin-bot-handoff.md](docs/ai/weixin-bot-handoff.md) | 处理个人微信群聊、`third_party/wechat4-vision-bot` 或它的补丁，或继续群机器人的交接任务时。 |
