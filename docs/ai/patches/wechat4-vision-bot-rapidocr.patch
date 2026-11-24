@@ -1,0 +1,968 @@
+diff --git a/config.example.json b/config.example.json
+index 7235921..9f7f716 100644
+--- a/config.example.json
++++ b/config.example.json
+@@ -55,9 +55,18 @@
+   },
+   "ocr": {
+     "enabled": true,
++    "engine": "tesseract",
++    "_engine_comment": "tesseract=每次识别启动一次 tesseract.exe；rapidocr=进程内 RapidOCR，先按 requirements-rapidocr.txt 安装。环境变量 WECHAT4_OCR_ENGINE 可临时覆盖。",
+     "tesseract": "",
+     "lang": "chi_sim",
+-    "timeoutMs": 10000
++    "timeoutMs": 10000,
++    "rapidocr": {
++      "_comment": "detModel/recModel 留空时用 rapidocr 包内置的 PP-OCRv6 small；用 PP-OCRv5 mobile 时填 models/ch_PP-OCRv5_det_mobile.onnx 和 models/ch_PP-OCRv5_rec_mobile.onnx。threads=0 用 ONNX Runtime 默认线程数；zoom 是识别前的放大倍数。",
++      "detModel": "",
++      "recModel": "",
++      "threads": 0,
++      "zoom": 1.0
++    }
+   },
+   "whitelistMatch": {
+     "coverageThreshold": 0.7,
+diff --git a/ocr_engine.py b/ocr_engine.py
+new file mode 100644
+index 0000000..9c660ee
+--- /dev/null
++++ b/ocr_engine.py
+@@ -0,0 +1,255 @@
++# -*- coding: utf-8 -*-
++"""OCR engine switch: Tesseract subprocess (default) or in-process RapidOCR.
++
++tesseract: every OCR call starts tesseract.exe, which reloads chi_sim each time.
++rapidocr:  RapidOCR + ONNX Runtime run inside this process; models load once.
++
++Pick the engine with config.json -> ocr.engine ("tesseract" | "rapidocr").
++The WECHAT4_OCR_ENGINE environment variable overrides the config, which lets a
++test script compare engines without editing config.json.
++
++Both engines record call counts and time so a run can report how much of its
++elapsed time went to OCR.
++"""
++import hashlib
++import os
++import subprocess
++import threading
++import time
++
++import cv2
++import numpy as np
++
++BASE_DIR = os.path.dirname(os.path.abspath(__file__))
++ENGINES = ("tesseract", "rapidocr")
++ENV_ENGINE = "WECHAT4_OCR_ENGINE"
++ENV_DET_MODEL = "WECHAT4_RAPIDOCR_DET"
++ENV_REC_MODEL = "WECHAT4_RAPIDOCR_REC"
++_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
++_CACHE_MAX = 64
++
++_lock = threading.Lock()
++_init_lock = threading.Lock()
++_cfg = {}
++_rapid = None
++_rapid_error = ""
++_cache = {}
++_stats = {"calls": 0, "ms": 0.0, "initMs": 0.0, "cacheHits": 0, "errors": 0}
++
++
++class OCREngineError(RuntimeError):
++    """The selected OCR engine cannot be loaded."""
++
++
++def configure(ocr_cfg):
++    """Use the `ocr` section of config.json. Safe to call repeatedly."""
++    global _cfg
++    _cfg = dict(ocr_cfg or {}) if isinstance(ocr_cfg, dict) else {}
++
++
++def engine():
++    name = os.environ.get(ENV_ENGINE, "") or _cfg.get("engine", "") or "tesseract"
++    name = str(name).strip().lower()
++    return name if name in ENGINES else "tesseract"
++
++
++def is_rapid():
++    return engine() == "rapidocr"
++
++
++def rapid_option(key, default=None):
++    rc = _cfg.get("rapidocr") or {}
++    value = rc.get(key) if isinstance(rc, dict) else None
++    return default if value in (None, "") else value
++
++
++def last_error():
++    return _rapid_error
++
++
++def stats():
++    with _lock:
++        out = dict(_stats)
++    out["engine"] = engine()
++    out["ms"] = int(round(out["ms"]))
++    out["initMs"] = int(round(out["initMs"]))
++    if _rapid_error:
++        out["error"] = _rapid_error
++    return out
++
++
++def clear_cache():
++    """Forget cached results (each new screenshot should be recognized afresh)."""
++    with _lock:
++        _cache.clear()
++
++
++def _record(t0):
++    with _lock:
++        _stats["calls"] += 1
++        _stats["ms"] += (time.perf_counter() - t0) * 1000.0
++
++
++# ─────────────── Tesseract ───────────────
++
++def run_tesseract(cmd, timeout):
++    """subprocess.run for a tesseract command line, timed for stats()."""
++    t0 = time.perf_counter()
++    try:
++        return subprocess.run(cmd, capture_output=True, timeout=timeout,
++                              creationflags=_NO_WINDOW)
++    finally:
++        _record(t0)
++
++
++# ─────────────── RapidOCR ───────────────
++
++def _model_path(env_key, cfg_key):
++    path = os.environ.get(env_key, "") or rapid_option(cfg_key, "")
++    if not path:
++        return ""
++    path = os.path.expandvars(str(path))
++    if not os.path.isabs(path):
++        path = os.path.join(BASE_DIR, path)
++    return path
++
++
++def _rapid_params():
++    params = {"Global.use_cls": False, "Global.log_level": "warning"}
++    det = _model_path(ENV_DET_MODEL, "detModel")
++    rec = _model_path(ENV_REC_MODEL, "recModel")
++    for path in (det, rec):
++        if path and not os.path.isfile(path):
++            raise OCREngineError("model file not found: %s" % path)
++    if det:
++        params["Det.model_path"] = det
++    if rec:
++        params["Rec.model_path"] = rec
++    threads = int(rapid_option("threads", 0) or 0)
++    if threads > 0:
++        params["EngineConfig.onnxruntime.intra_op_num_threads"] = threads
++    for key, dst in (("detLimitSideLen", "Det.limit_side_len"),
++                     ("detLimitType", "Det.limit_type"),
++                     ("textScore", "Global.text_score")):
++        value = rapid_option(key)
++        if value is not None:
++            params[dst] = value
++    return params
++
++
++def _get_rapid():
++    """Load RapidOCR once per process; raise OCREngineError if it cannot load."""
++    global _rapid, _rapid_error
++    if _rapid is not None:
++        return _rapid
++    with _init_lock:
++        if _rapid is not None:
++            return _rapid
++        if _rapid_error:
++            raise OCREngineError(_rapid_error)
++        t0 = time.perf_counter()
++        try:
++            from rapidocr import RapidOCR
++            _rapid = RapidOCR(params=_rapid_params())
++        except OCREngineError as exc:
++            _rapid_error = str(exc)
++            raise
++        except Exception as exc:
++            _rapid_error = "rapidocr unavailable: %s: %s" % (type(exc).__name__, exc)
++            raise OCREngineError(_rapid_error)
++        finally:
++            with _lock:
++                _stats["initMs"] += (time.perf_counter() - t0) * 1000.0
++    return _rapid
++
++
++def _as_bgr(img):
++    """PIL image, RGB array or grayscale array -> contiguous BGR array."""
++    arr = np.asarray(img)
++    if arr.ndim == 2:
++        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
++    elif arr.ndim == 3 and arr.shape[2] == 4:
++        arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
++    elif arr.ndim == 3 and arr.shape[2] == 3:
++        arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
++    return np.ascontiguousarray(arr, dtype=np.uint8)
++
++
++def rapid_lines(img, detect=True):
++    """Run RapidOCR on an image region.
++
++    detect=True finds text boxes first and returns one entry per box.
++    detect=False recognizes the whole image as one text line.
++    Returns [{text, score, x0, y0, x1, y1}] in the input image's pixels.
++    Model load failures raise OCREngineError; per-call failures return [].
++    """
++    arr = _as_bgr(img)
++    h, w = arr.shape[:2]
++    if h < 4 or w < 4:
++        return []
++    key = (bool(detect), arr.shape, hashlib.blake2b(arr.tobytes(), digest_size=16).digest())
++    with _lock:
++        cached = _cache.get(key)
++        if cached is not None:
++            _stats["cacheHits"] += 1
++            return [dict(x) for x in cached]
++    ocr = _get_rapid()
++    t0 = time.perf_counter()
++    try:
++        res = ocr(arr, use_det=bool(detect), use_cls=False, use_rec=True)
++        lines = _parse_result(res, w, h, detect)
++    except Exception:
++        with _lock:
++            _stats["errors"] += 1
++        return []
++    finally:
++        _record(t0)
++    with _lock:
++        if len(_cache) >= _CACHE_MAX:
++            _cache.clear()
++        _cache[key] = [dict(x) for x in lines]
++    return lines
++
++
++def _parse_result(res, w, h, detect):
++    txts = list(getattr(res, "txts", None) or ())
++    scores = list(getattr(res, "scores", None) or ())
++    boxes = getattr(res, "boxes", None) if detect else None
++    lines = []
++    for i, text in enumerate(txts):
++        text = " ".join(str(text or "").split())
++        if not text:
++            continue
++        if boxes is not None and i < len(boxes):
++            pts = np.asarray(boxes[i], dtype=float).reshape(-1, 2)
++            x0, y0 = float(pts[:, 0].min()), float(pts[:, 1].min())
++            x1, y1 = float(pts[:, 0].max()), float(pts[:, 1].max())
++        else:
++            x0, y0, x1, y1 = 0.0, 0.0, float(w), float(h)
++        score = float(scores[i]) if i < len(scores) else 0.0
++        lines.append({"text": text, "score": score,
++                      "x0": x0, "y0": y0, "x1": x1, "y1": y1})
++    return lines
++
++
++def join_lines(lines):
++    """Join boxes in reading order: rows top to bottom, boxes left to right."""
++    rows = []
++    for ln in sorted(lines, key=lambda d: (d["y0"] + d["y1"]) / 2.0):
++        cy = (ln["y0"] + ln["y1"]) / 2.0
++        hh = max(1.0, ln["y1"] - ln["y0"])
++        for row in rows:
++            if abs(row["cy"] - cy) <= 0.5 * max(hh, row["h"]):
++                row["items"].append(ln)
++                break
++        else:
++            rows.append({"cy": cy, "h": hh, "items": [ln]})
++    parts = []
++    for row in rows:
++        parts.extend(d["text"] for d in sorted(row["items"], key=lambda d: d["x0"]))
++    return " ".join(parts)
++
++
++def rapid_text(img, single_line=False):
++    """Text of a region as one string, matching what callers get from tesseract stdout."""
++    return join_lines(rapid_lines(img, detect=not single_line))
+diff --git a/overrides-rapidocr.txt b/overrides-rapidocr.txt
+new file mode 100644
+index 0000000..16b471c
+--- /dev/null
++++ b/overrides-rapidocr.txt
+@@ -0,0 +1,2 @@
++# Never install opencv-python-headless: opencv-python from requirements.txt already provides cv2.
++opencv-python-headless; sys_platform == "never"
+diff --git a/reply.py b/reply.py
+index c02ee2f..b5f9d0d 100644
+--- a/reply.py
++++ b/reply.py
+@@ -43,10 +43,12 @@ import threading
+ import time
+ import traceback
+ 
++_T_IMPORT0 = time.monotonic()
+ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ sys.path.insert(0, BASE_DIR)
+ 
+ import busyguard  # noqa: E402
++import ocr_engine  # noqa: E402
+ import watcher  # noqa: E402
+ 
+ import cv2  # noqa: E402
+@@ -553,6 +555,8 @@ class Ctx:
+         # 2026-10-27 第一阶段：搜索层「确证」时间戳（只有确证后才允许按 Esc）
+         self.search_open_ts = 0.0
+         self.search_confirmed_by = ""
++        self.wait_s = 0.0      # time spent in ctx.sleep waiting for the UI
++        self.capture_s = 0.0   # time spent taking window screenshots
+         self.prev_fg = int(user32.GetForegroundWindow() or 0)
+         self._thread = threading.Thread(target=self._watchdog, name="reply-hard-timeout", daemon=True)
+         self._thread.start()
+@@ -584,13 +588,33 @@ class Ctx:
+             time.sleep(0.03)
+ 
+     def sleep(self, seconds):
+-        end = time.monotonic() + max(0.0, float(seconds))
+-        while True:
+-            self.check()
+-            left = end - time.monotonic()
+-            if left <= 0:
+-                return
+-            time.sleep(min(0.02, left))
++        start = time.monotonic()
++        end = start + max(0.0, float(seconds))
++        try:
++            while True:
++                self.check()
++                left = end - time.monotonic()
++                if left <= 0:
++                    return
++                time.sleep(min(0.02, left))
++        finally:
++            self.wait_s += time.monotonic() - start
++
++    def timing(self):
++        """Elapsed time split in ms: OCR, model load, UI waits, screenshots, everything else."""
++        st = ocr_engine.stats()
++        total = self.elapsed() * 1000.0
++        wait = self.wait_s * 1000.0
++        cap = self.capture_s * 1000.0
++        return {
++            "engine": st["engine"],
++            "totalMs": int(total),
++            "importMs": int((self.t0 - _T_IMPORT0) * 1000.0),
++            "ocrMs": st["ms"], "ocrCalls": st["calls"], "ocrInitMs": st["initMs"],
++            "ocrCacheHits": st["cacheHits"], "ocrErrors": st["errors"],
++            "waitMs": int(wait), "captureMs": int(cap),
++            "otherMs": int(total - st["ms"] - st["initMs"] - wait - cap),
++        }
+ 
+     def check(self):
+         if self.abort.is_set():
+@@ -697,6 +721,14 @@ def ensure_wechat_ready(ctx):
+ 
+ 
+ def capture_window(ctx, hwnd):
++    t0 = time.monotonic()
++    try:
++        return _capture_window(ctx, hwnd)
++    finally:
++        ctx.capture_s += time.monotonic() - t0
++
++
++def _capture_window(ctx, hwnd):
+     l, t, r, b = watcher.window_rect(hwnd)
+     w, h = r - l, b - t
+     if w <= 100 or h <= 100:
+@@ -724,6 +756,14 @@ def _same_process(hwnd_a, hwnd_b):
+ 
+ 
+ def capture_screen_window(ctx, hwnd):
++    t0 = time.monotonic()
++    try:
++        return _capture_screen_window(ctx, hwnd)
++    finally:
++        ctx.capture_s += time.monotonic() - t0
++
++
++def _capture_screen_window(ctx, hwnd):
+     """整窗「屏幕」截图（ImageGrab）：微信搜索下拉是 Qt popup，PrintWindow 抓不到，
+     必须用屏幕抓图（且抓图 bbox 正好 = 窗口矩形，所以图像坐标 == 窗口矩形坐标）。
+ 
+@@ -861,6 +901,14 @@ def activate_window(ctx, hwnd):
+ _TESS = None
+ 
+ 
++def rapid_text(img, single_line=False):
++    """RapidOCR text; abort like a missing tesseract when the engine cannot load."""
++    try:
++        return ocr_engine.rapid_text(img, single_line=single_line)
++    except ocr_engine.OCREngineError as exc:
++        raise ReplyAbort("ocr-unavailable（%s；未做任何发送动作）" % exc)
++
++
+ def tesseract_bin():
+     global _TESS
+     if _TESS is None:
+@@ -921,6 +969,10 @@ def ocr_candidates(img, box, ctx, max_plans=2):
+     if x1 - x0 < 8 or y1 - y0 < 8:
+         return out
+     crop = img.crop((x0, y0, x1, y1))
++    if ocr_engine.is_rapid():
++        ctx.check()
++        txt = rapid_text(crop)
++        return [txt] if txt else []
+     for mode, use_bbox, psm in DEFAULT_PLANS:
+         ctx.check()
+         if len(out) >= max_plans:
+@@ -945,6 +997,8 @@ def ocr_chat_title(img, geom, ctx):
+     gray = np.asarray(img.crop(geom["header"]).convert("L"))
+     if min(gray.shape) < 8:
+         return ""
++    if ocr_engine.is_rapid():
++        return rapid_text(img.crop(geom["header"]))
+     if np.median(gray) < 128:
+         gray = cv2.bitwise_not(gray)
+     scaled = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+@@ -1121,10 +1175,9 @@ def _ocr_tsv_lines(img, box, ctx, psm=6):
+             os.close(fd)
+             from PIL import Image as _Image
+             _Image.fromarray(big).save(path)
+-            p = subprocess.run(
++            p = ocr_engine.run_tesseract(
+                 [tess, path, "stdout", "-l", "chi_sim", "--psm", str(use_psm),
+-                 "--oem", "1", "--dpi", "300", "tsv"],
+-                capture_output=True, timeout=8.0, creationflags=0x08000000)
++                 "--oem", "1", "--dpi", "300", "tsv"], 8.0)
+         except Exception as exc:
+             log("  [下拉] TSV OCR 失败(%s): %s" % (tag, exc))
+             continue
+@@ -1297,6 +1350,8 @@ def _ocr_words(img, box, ctx, psm=6, zoom=2.0, psms=None, include_orig=True, inv
+     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+     # 2026-10-27：invert=False 用于「浅色背景 + 深色文字」的聊天区气泡；
+     # 搜索下拉是深色背景 + 浅色文字，需要反色（invert=True，默认）。
++    if ocr_engine.is_rapid():
++        return _rapid_words(rgb, x0, y0)
+     gray_inv = cv2.bitwise_not(gray) if invert else gray
+     z = float(zoom or 2.0)
+     # 同一个放大图的多 PSM（psm 6 段落 / psm 11 稀疏文字）；多遍结果在 _ocr_rows 里做行级并集
+@@ -1328,10 +1383,9 @@ def _ocr_words(img, box, ctx, psm=6, zoom=2.0, psms=None, include_orig=True, inv
+             os.close(fd)
+             from PIL import Image as _Image
+             _Image.fromarray(big).save(path)
+-            p = subprocess.run(
++            p = ocr_engine.run_tesseract(
+                 [tess, path, "stdout", "-l", "chi_sim", "--psm", str(use_psm),
+-                 "--oem", "1", "--dpi", "300", "tsv"],
+-                capture_output=True, timeout=8.0, creationflags=0x08000000)
++                 "--oem", "1", "--dpi", "300", "tsv"], 8.0)
+         except Exception as exc:
+             log("  [下拉] TSV OCR 失败(%s): %s" % (tag, exc))
+             continue
+@@ -1364,6 +1418,31 @@ def _ocr_words(img, box, ctx, psm=6, zoom=2.0, psms=None, include_orig=True, inv
+     return words
+ 
+ 
++def _rapid_words(rgb, x0, y0):
++    """RapidOCR version of _ocr_words: one detect+recognize pass on the original colors.
++
++    Each text box becomes one "word". The upscaling, inversion, extra PSM passes and
++    green mask exist for Tesseract and are skipped; ocr.rapidocr.zoom can upscale.
++    """
++    zoom = float(ocr_engine.rapid_option("zoom", 1.0) or 1.0)
++    arr = rgb
++    if abs(zoom - 1.0) > 1e-6:
++        arr = cv2.resize(rgb, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_CUBIC)
++    try:
++        lines = ocr_engine.rapid_lines(arr)
++    except ocr_engine.OCREngineError as exc:
++        raise ReplyAbort("ocr-unavailable（%s；未做任何发送动作）" % exc)
++    words = []
++    for ln in lines:
++        words.append({
++            "text": ln["text"], "src": "rapid",
++            "x0": ln["x0"] / zoom + x0, "x1": ln["x1"] / zoom + x0,
++            "top": ln["y0"] / zoom + y0, "bottom": ln["y1"] / zoom + y0,
++            "y": (ln["y0"] + ln["y1"]) / 2.0 / zoom + y0,
++        })
++    return words
++
++
+ def _cluster_rows(words, s=1.0, y_tol=10.0, x_gap=60.0):
+     """词级坐标 -> 行（按 y 邻近聚类；同一 y 内按 x 间隙切分成多段，避免跨面板/聊天区合并）。"""
+     rows = []
+@@ -2112,6 +2191,8 @@ def _ocr_row_text_psm7(img, row):
+     path = ""
+     try:
+         crop = img.crop((x0, y0, x1, y1))
++        if ocr_engine.is_rapid():
++            return _clean_row_text(rapid_text(crop, single_line=True))
+         gray = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+         arr = cv2.bitwise_not(gray)
+         big = cv2.resize(arr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+@@ -2123,9 +2204,8 @@ def _ocr_row_text_psm7(img, row):
+         os.close(fd)
+         from PIL import Image as _Image
+         _Image.fromarray(big).save(path)
+-        p = subprocess.run([tess, path, "stdout", "-l", "chi_sim", "--psm", "7",
+-                            "--oem", "1", "--dpi", "300"],
+-                           capture_output=True, timeout=8.0, creationflags=0x08000000)
++        p = ocr_engine.run_tesseract([tess, path, "stdout", "-l", "chi_sim", "--psm", "7",
++                                      "--oem", "1", "--dpi", "300"], 8.0)
+         text = p.stdout.decode("utf-8", "replace").strip()
+         return _clean_row_text(text.splitlines()[0] if text else "")
+     except Exception as exc:
+@@ -3253,8 +3333,14 @@ def _ocr_bubble_text_precise(img, top, bottom, x0, x1):
+             py1 = min(gray.shape[0], int(ys.max()) + 5)
+             if px1 - px0 >= 6 and py1 - py0 >= 6:
+                 gray = gray[py0:py1, px0:px1]
++                rgb = rgb[py0:py1, px0:px1]
+     except Exception:
+         pass
++    if ocr_engine.is_rapid():
++        txt = rapid_text(rgb)
++        out = [txt] if txt else []
++        log("  [READ] 气泡精读(RapidOCR) crop=(%d,%d,%d,%d) 候选=%r" % (bx0, by0, bx1, by1, out))
++        return out
+     norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+     inv = cv2.bitwise_not(norm)
+     tess = tesseract_bin()
+@@ -3276,10 +3362,9 @@ def _ocr_bubble_text_precise(img, top, bottom, x0, x1):
+                 os.close(fd)
+                 from PIL import Image as _Image
+                 _Image.fromarray(big).save(path)
+-                p = subprocess.run(
++                p = ocr_engine.run_tesseract(
+                     [tess, path, "stdout", "-l", "chi_sim", "--psm", str(psm),
+-                     "--oem", "1", "--dpi", "300"],
+-                    capture_output=True, timeout=8.0, creationflags=0x08000000)
++                     "--oem", "1", "--dpi", "300"], 8.0)
+                 txt = (p.stdout.decode("utf-8", "replace") or "").strip()
+                 txt = re.sub(r"\s+", " ", txt)
+                 if txt and txt not in out:
+@@ -3608,7 +3693,7 @@ def read_chat_incoming_bubbles(ctx, img, geom, max_bubbles=3, crop_out=""):
+             "crop": crop_path, "cropSize": crop_size}
+ 
+ 
+-def run_read_messages(ctx, cfg, target, max_bubbles=3, crop_out=""):
++def run_read_messages(ctx, cfg, target, max_bubbles=3, crop_out="", save_shot=False):
+     """只读模式：打开会话 -> OCR 聊天区最后 N 条对方消息（可选另存裁剪图）-> 打印 JSON。
+ 
+     只读：不点输入框、不输入、不按 Enter。
+@@ -3676,24 +3761,35 @@ def run_read_messages(ctx, cfg, target, max_bubbles=3, crop_out=""):
+         ctx.sleep(0.4)
+         img = capture_window(ctx, hwnd)
+         geom = geom_of(img, scale)
++        shot = save_img(img, "read") if save_shot else ""
++        if shot:
++            log("只读截图（供 tools/ocr_bench.py 离线对比）: %s" % shot)
+         result = read_chat_incoming_bubbles(ctx, img, geom, max_bubbles=max_bubbles,
+                                             crop_out=crop_out)
++        timing = ctx.timing()
+         print(json.dumps({"ok": True, "chat": target,
+                           "bubbles": result.get("bubbles") or [],
+                           "rowsTotal": result.get("rows_total"),
+                           "crop": result.get("crop") or "",
+                           "cropSize": result.get("cropSize") or [0, 0],
+-                          "elapsed": round(ctx.elapsed(), 2)},
++                          "elapsed": round(ctx.elapsed(), 2),
++                          "scale": scale,
++                          "shot": shot,
++                          "timing": timing},
+                          ensure_ascii=False))
+         log_stage("read-done", "只读读取完成：%d 条对方消息（未输入、未发送）"
+                   % len(result.get("bubbles") or []))
++        log("耗时拆分: %s" % json.dumps(timing, ensure_ascii=False))
+         return 0
+     except ReplyAbort as exc:
+         log_stage("read-abort", "阶段=%s 原因=%s（只读模式：已释放按键；未输入、未发送）"
+                   % (getattr(ctx, "step", "?"), exc))
+         log("abort(read-msg): %s" % exc)
++        timing = ctx.timing()
+         print(json.dumps({"ok": False, "skip": str(exc), "chat": target,
+-                          "elapsed": round(ctx.elapsed(), 2)}, ensure_ascii=False))
++                          "elapsed": round(ctx.elapsed(), 2),
++                          "timing": timing}, ensure_ascii=False))
++        log("耗时拆分: %s" % json.dumps(timing, ensure_ascii=False))
+         return 1
+     except Exception as exc:
+         log_error("read-msg 未捕获异常", exc)
+@@ -4019,15 +4115,20 @@ def main(argv=None):
+                     help="--read-msg 时最多返回几条对方消息（1-5，默认 3）")
+     ap.add_argument("--crop-out", default="",
+                     help="--read-msg 时把聊天区底部（含最后几条气泡）另存为 PNG，供多模态模型看图")
++    ap.add_argument("--save-shot", action="store_true",
++                    help="--read-msg 时把打开会话后的整窗截图存到 screenshots/，供 tools/ocr_bench.py 离线对比")
+     args = ap.parse_args(argv)
+     if args.match and args.match.strip() and args.match.strip() != args.chat.strip():
+         log("提示: --match=%r 已忽略（v2 只用 --chat 名做键盘搜索）" % args.match)
+     cfg = watcher.load_config()
++    ocr_engine.configure(cfg.get("ocr"))
++    log("OCR 引擎: %s" % ocr_engine.engine())
+     if args.read_msg:
+         ctx = Ctx(cfg, timeout=READ_TIMEOUT_SECONDS)
+         try:
+             rc = run_read_messages(ctx, cfg, args.chat, args.max_bubbles,
+-                                   crop_out=getattr(args, "crop_out", ""))
++                                   crop_out=getattr(args, "crop_out", ""),
++                                   save_shot=args.save_shot)
+             log_stage("done", "退出码=%s（read-msg 只读模式）" % rc)
+             return rc
+         finally:
+diff --git a/requirements-rapidocr.txt b/requirements-rapidocr.txt
+new file mode 100644
+index 0000000..45723a6
+--- /dev/null
++++ b/requirements-rapidocr.txt
+@@ -0,0 +1,10 @@
++# Optional OCR engine: RapidOCR + ONNX Runtime, used when config.json sets ocr.engine to "rapidocr".
++# rapidocr depends on opencv-python-headless, which would install a second cv2 next to
++# opencv-python from requirements.txt. overrides-rapidocr.txt drops it, so always pass both files:
++#
++#   uv pip install --python .venv\Scripts\python.exe -r requirements-rapidocr.txt --overrides overrides-rapidocr.txt
++#
++# Offline: add --offline --no-index --find-links <wheel dir>.
++# PP-OCRv6 small models ship inside the rapidocr wheel; other models go in models\.
++rapidocr==3.10.0
++onnxruntime==1.32.0
+diff --git a/tools/ocr_bench.py b/tools/ocr_bench.py
+new file mode 100644
+index 0000000..08eea4e
+--- /dev/null
++++ b/tools/ocr_bench.py
+@@ -0,0 +1,217 @@
++# -*- coding: utf-8 -*-
++"""Compare OCR engines on saved WeChat window screenshots (offline, read-only).
++
++Each variant runs in a fresh Python process, like a real `reply.py --read-msg`,
++so model loading counts toward its first image. Each process OCRs the chat title
++and the incoming bubbles with the same reply.py functions the read path uses.
++
++Collect screenshots with `reply.py --read-msg --chat "Test" --save-shot`. The JSON
++output gives the screenshot path and the window's DPI scale.
++
++  .venv\\Scripts\\python.exe tools\\ocr_bench.py screenshots\\*-read.png
++  .venv\\Scripts\\python.exe tools\\ocr_bench.py --variants tesseract,rapidocr,v5mobile,v6tiny ^
++      --scale 1.25 --repeat 3 screenshots\\*-read.png
++
++Variants: tesseract; rapidocr (PP-OCRv6 small bundled in the rapidocr wheel);
++v5mobile and v6tiny (model files under models\\, see MODEL_PRESETS).
++Nothing is clicked or typed; screenshots are only read.
++"""
++import argparse
++import glob
++import json
++import os
++import subprocess
++import sys
++import time
++
++BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++MARK = "@@OCR_BENCH@@"
++MODEL_PRESETS = {
++    "tesseract": {"engine": "tesseract"},
++    "rapidocr": {"engine": "rapidocr"},
++    "v5mobile": {"engine": "rapidocr",
++                 "det": "models/ch_PP-OCRv5_det_mobile.onnx",
++                 "rec": "models/ch_PP-OCRv5_rec_mobile.onnx"},
++    "v6tiny": {"engine": "rapidocr",
++               "det": "models/PP-OCRv6_det_tiny.onnx",
++               "rec": "models/PP-OCRv6_rec_tiny.onnx"},
++}
++
++
++class BenchCtx:
++    """Stand-in for reply.Ctx: no deadline, no input guard, no waiting."""
++    step = "bench"
++
++    def check(self):
++        pass
++
++    def checkpoint(self, *_args, **_kwargs):
++        pass
++
++    def sleep(self, _seconds):
++        pass
++
++
++def run_child(args):
++    t0 = time.perf_counter()
++    sys.path.insert(0, BOT_DIR)
++    os.chdir(BOT_DIR)
++    import ocr_engine
++    import reply
++    from PIL import Image
++
++    logs = []
++    reply.log = lambda msg: logs.append(str(msg))  # keep bench lines out of logs/watchdog-*.log
++    ocr_engine.configure(reply.watcher.load_config().get("ocr"))
++    import_ms = (time.perf_counter() - t0) * 1000.0
++    ctx = BenchCtx()
++    results = []
++    for rnd in range(args.repeat):
++        for path in args.images:
++            img = Image.open(path).convert("RGB")
++            ocr_engine.clear_cache()  # no reuse across images or rounds
++            geom = reply.geom_of(img, args.scale)
++            item = {"round": rnd, "image": path}
++            t = time.perf_counter()
++            try:
++                item["title"] = reply.ocr_chat_title(img, geom, ctx)
++            except Exception as exc:
++                item["title"] = ""
++                item["error"] = "%s: %s" % (type(exc).__name__, exc)
++            item["titleMs"] = int((time.perf_counter() - t) * 1000)
++            t = time.perf_counter()
++            try:
++                res = reply.read_chat_incoming_bubbles(ctx, img, geom, max_bubbles=args.max_bubbles)
++                item["bubbles"] = [b.get("text", "") for b in (res.get("bubbles") or [])]
++            except Exception as exc:
++                item["bubbles"] = []
++                item["error"] = "%s: %s" % (type(exc).__name__, exc)
++            item["readMs"] = int((time.perf_counter() - t) * 1000)
++            results.append(item)
++    out = {"importMs": int(import_ms), "results": results, "stats": ocr_engine.stats()}
++    if args.verbose:
++        out["log"] = logs[-200:]
++    print(MARK + json.dumps(out, ensure_ascii=False), flush=True)
++    return 0
++
++
++def expand_images(patterns):
++    files = []
++    for pat in patterns:
++        hits = sorted(glob.glob(pat)) or ([pat] if os.path.isfile(pat) else [])
++        files.extend(os.path.abspath(h) for h in hits)
++    return list(dict.fromkeys(files))
++
++
++def run_variant(name, args, images):
++    preset = MODEL_PRESETS.get(name)
++    if preset is None:
++        return {"variant": name, "error": "unknown variant (choose from %s)" % ", ".join(MODEL_PRESETS)}
++    env = dict(os.environ)
++    env["WECHAT4_OCR_ENGINE"] = preset["engine"]
++    env.pop("WECHAT4_RAPIDOCR_DET", None)
++    env.pop("WECHAT4_RAPIDOCR_REC", None)
++    for key, var in (("det", "WECHAT4_RAPIDOCR_DET"), ("rec", "WECHAT4_RAPIDOCR_REC")):
++        if preset.get(key):
++            path = os.path.join(BOT_DIR, preset[key])
++            if not os.path.isfile(path):
++                return {"variant": name, "error": "model file missing: %s" % path}
++            env[var] = path
++    cmd = [sys.executable, os.path.abspath(__file__), "--child",
++           "--scale", str(args.scale), "--repeat", str(args.repeat),
++           "--max-bubbles", str(args.max_bubbles)]
++    if args.verbose:
++        cmd.append("--verbose")
++    cmd.extend(images)
++    t = time.perf_counter()
++    try:
++        proc = subprocess.run(cmd, cwd=BOT_DIR, env=env, capture_output=True, text=True,
++                              encoding="utf-8", errors="replace", timeout=args.timeout)
++    except subprocess.TimeoutExpired:
++        return {"variant": name, "error": "timeout after %.0fs" % args.timeout}
++    wall_ms = int((time.perf_counter() - t) * 1000)
++    for line in reversed(proc.stdout.splitlines()):
++        if line.startswith(MARK):
++            data = json.loads(line[len(MARK):])
++            data.update({"variant": name, "wallMs": wall_ms})
++            return data
++    tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
++    return {"variant": name, "wallMs": wall_ms, "error": "child exit %s: %s" % (proc.returncode, " | ".join(tail))}
++
++
++def summarize(data):
++    res = data.get("results") or []
++    per_image = [r["titleMs"] + r["readMs"] for r in res]
++    later = per_image[1:]
++    st = data.get("stats") or {}
++    return {
++        "wallMs": data.get("wallMs"),
++        "importMs": data.get("importMs"),
++        "initMs": st.get("initMs"),
++        "firstMs": per_image[0] if per_image else None,
++        "laterAvgMs": int(sum(later) / len(later)) if later else None,
++        "ocrCalls": st.get("calls"),
++        "ocrMs": st.get("ms"),
++        "errors": sum(1 for r in res if r.get("error")) + int(st.get("errors") or 0),
++    }
++
++
++def print_report(runs, images):
++    cols = ["wallMs", "importMs", "initMs", "firstMs", "laterAvgMs", "ocrCalls", "ocrMs", "errors"]
++    print("\n== 耗时（毫秒）：wall=整个子进程；first=第一张图（含模型首次加载）；laterAvg=其余平均 ==")
++    print("%-10s " % "variant" + " ".join("%10s" % c for c in cols))
++    for run in runs:
++        if run.get("error"):
++            print("%-10s %s" % (run["variant"], run["error"]))
++            continue
++        s = summarize(run)
++        print("%-10s " % run["variant"] + " ".join("%10s" % ("-" if s[c] is None else s[c]) for c in cols))
++    print("\n== 识别结果（第一轮）==")
++    for path in images:
++        print("\n# %s" % os.path.basename(path))
++        for run in runs:
++            if run.get("error"):
++                continue
++            first = next((r for r in run["results"] if r["image"] == path and r["round"] == 0), None)
++            if first is None:
++                continue
++            print("  %-10s 标题=%r" % (run["variant"], first.get("title", "")))
++            print("  %-10s 气泡=%r%s" % ("", first.get("bubbles", []),
++                                        ("  错误=" + first["error"]) if first.get("error") else ""))
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description="Offline OCR engine comparison on WeChat screenshots")
++    ap.add_argument("images", nargs="+", help="PNG screenshots of the WeChat window (globs allowed)")
++    ap.add_argument("--variants", default="tesseract,rapidocr",
++                    help="comma list from: %s" % ", ".join(MODEL_PRESETS))
++    ap.add_argument("--scale", type=float, default=1.0, help="window DPI scale (1.0 = 100%%, 1.25 = 125%%)")
++    ap.add_argument("--repeat", type=int, default=2, help="passes over all images per process")
++    ap.add_argument("--max-bubbles", type=int, default=3)
++    ap.add_argument("--timeout", type=float, default=900.0, help="seconds per variant process")
++    ap.add_argument("--out", default="", help="write the full JSON report here")
++    ap.add_argument("--verbose", action="store_true", help="keep reply.py log lines in the report")
++    ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
++    args = ap.parse_args(argv)
++    try:
++        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
++    except Exception:
++        pass
++    if args.child:
++        return run_child(args)
++    images = expand_images(args.images)
++    if not images:
++        print("没有找到截图: %s" % " ".join(args.images))
++        return 2
++    runs = [run_variant(v.strip(), args, images) for v in args.variants.split(",") if v.strip()]
++    print_report(runs, images)
++    if args.out:
++        with open(args.out, "w", encoding="utf-8") as f:
++            json.dump({"images": images, "scale": args.scale, "repeat": args.repeat, "runs": runs},
++                      f, ensure_ascii=False, indent=2)
++        print("\n报告: %s" % os.path.abspath(args.out))
++    return 1 if any(r.get("error") for r in runs) else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/watcher.py b/watcher.py
+index 963f117..1ad60aa 100644
+--- a/watcher.py
++++ b/watcher.py
+@@ -96,6 +96,8 @@ try:
+ except Exception as exc:  # pragma: no cover
+     raise SystemExit("需要 sendguard.py（发送护栏）: %s" % exc)
+ 
++import ocr_engine  # noqa: E402  OCR engine switch: tesseract / rapidocr
++
+ # ─────────────────────────── paths / constants ───────────────────────────
+ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+@@ -317,9 +319,11 @@ DEFAULT_CONFIG = {
+     "dedupe": {"settleScans": 2},
+     "ocr": {
+         "enabled": True,
++        "engine": "tesseract",
+         "tesseract": "",
+         "lang": "chi_sim",
+         "timeoutMs": 10000,
++        "rapidocr": {"detModel": "", "recModel": "", "threads": 0, "zoom": 1.0},
+     },
+     "whitelistMatch": {
+         # 旧 prefix 匹配参数（保留：黑名单/单条 hint 匹配仍用 name_match）
+@@ -1165,10 +1169,9 @@ def _tess_run(arr, psm, tesseract, lang="chi_sim", timeout_ms=10000):
+         path = os.path.join(_OCR_TMP_DIR, "ocr-%s.png" % uuid.uuid4().hex[:8])
+         Image.fromarray(arr).save(path)
+         try:
+-            p = subprocess.run(
++            p = ocr_engine.run_tesseract(
+                 [tesseract, path, "stdout", "-l", lang, "--psm", str(psm), "--oem", "1", "--dpi", "300"],
+-                capture_output=True, timeout=max(3.0, timeout_ms / 1000.0),
+-                creationflags=0x08000000)
++                max(3.0, timeout_ms / 1000.0))
+             return " ".join(p.stdout.decode("utf-8", "replace").split())
+         finally:
+             try:
+@@ -1179,6 +1182,20 @@ def _tess_run(arr, psm, tesseract, lang="chi_sim", timeout_ms=10000):
+         return ""
+ 
+ 
++def _rapid_crop_text(pil_img, box):
++    """RapidOCR text of a crop; "" when the box is empty or the engine cannot load."""
++    W, H = pil_img.size
++    x0, y0 = max(0, min(W, box[0])), max(0, min(H, box[1]))
++    x1, y1 = max(0, min(W, box[2])), max(0, min(H, box[3]))
++    if x1 - x0 < 10 or y1 - y0 < 8:
++        return ""
++    try:
++        return ocr_engine.rapid_text(pil_img.crop((x0, y0, x1, y1)))
++    except ocr_engine.OCREngineError as exc:
++        log_warn("RapidOCR 不可用: %s" % exc)
++        return ""
++
++
+ def _ocr_text_bbox(gray, thresh=105):
+     mask = (gray > thresh).astype(np.uint8)
+     ys, xs = np.where(mask > 0)
+@@ -1233,6 +1250,9 @@ def _ocr_row_name_candidates(pil_img, geom, row_idx, tesseract, ocr_cfg):
+     top = rows_top + row_idx * row_h
+     box_fixed = (lx0 + int(62 * s), top + int(12 * s), lx1 - int(56 * s), top + int(40 * s))
+     box_wide = (lx0 + int(56 * s), top + int(8 * s), lx1 - int(50 * s), top + int(44 * s))
++    if ocr_engine.is_rapid():
++        txt = _rapid_crop_text(pil_img, box_wide)
++        return [txt] if txt else []
+     plans = [
+         (box_fixed, "plain2x", False, 7),
+         (box_fixed, "bin3x", True, 6),
+@@ -1315,6 +1335,12 @@ def _ocr_row_preview(pil_img, geom, row_idx, tesseract, ocr_cfg):
+     row_h = int(round(geom["row_h"] * s))
+     top = rows_top + row_idx * row_h
+     box = (lx0 + int(62 * s), top + int(40 * s), lx1 - int(14 * s), top + int(62 * s))
++    if ocr_engine.is_rapid():
++        txt = _rapid_crop_text(pil_img, box)
++        if not re.search(r"[\w\u4e00-\u9fff]", txt):
++            txt = ""
++        return {"text": txt, "variants": [txt] if txt else [],
++                "big": [txt] if txt else [], "orig": []}
+     plans = [
+         (box, "norm3x", True, 6),
+         (box, "bin3x", True, 6),
+@@ -3345,9 +3371,10 @@ class Watchdog:
+         ocr_cfg = self.config.get("ocr") or {}
+         if not ocr_cfg.get("enabled", True):
+             return "", "ocr-disabled", []
++        ocr_engine.configure(ocr_cfg)
+         if self._tesseract is None:
+             self._tesseract = find_tesseract(ocr_cfg.get("tesseract", ""))
+-        if not self._tesseract:
++        if not self._tesseract and not ocr_engine.is_rapid():
+             log_warn("%s OCR 不可用（找不到 tesseract）-> 只把会话名告诉模型" % genreply.GEN_TAG)
+             return "", "no-tesseract", []
+         row_idx = int(row.get("row", 0) or 0)
+@@ -4824,19 +4851,22 @@ class Watchdog:
+         ocr_cfg = self.config.get("ocr") or {}
+         match_cfg = self.config.get("whitelistMatch") or {}
+         tesseract = ""
++        use_ocr = False
+         if ocr_cfg.get("enabled", True):
++            ocr_engine.configure(ocr_cfg)
+             if self._tesseract is None:
+                 self._tesseract = find_tesseract(ocr_cfg.get("tesseract", ""))
+-                if not self._tesseract:
++                if not self._tesseract and not ocr_engine.is_rapid():
+                     log_error("名单判定 unknown: 找不到 tesseract（OCR 不可用）-> 本次不发送")
+             tesseract = self._tesseract
++            use_ocr = bool(tesseract) or ocr_engine.is_rapid()
+         rows = []
+         any_white = False
+         any_black = False
+         for r in row_infos:
+             row_idx = int(r.get("row", 0))
+             candidates = []
+-            if tesseract:
++            if use_ocr:
+                 try:
+                     candidates = _ocr_row_name_candidates(
+                         info["img"], info["geom"], row_idx, tesseract, ocr_cfg)

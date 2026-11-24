@@ -5,7 +5,7 @@ CowAgent 的 `weixin` 通道只收私聊（[weixin_message.py](../../channel/wei
 ## 代码位置
 
 - 上游源码原样放在 [third_party/wechat4-vision-bot](../../third_party/wechat4-vision-bot)，对应 [上游提交 `3bf7b905`](https://github.com/HUTAOLIUYINGWEITA/wechat4-vision-bot/tree/3bf7b90580d4e467434ae2d39c52af2a6937db9a)。`third_party/.gitattributes` 让 git 不转换换行，`.cmd` 必须保持 CRLF。
-- 我们的改动是 [只读测试补丁](patches/wechat4-vision-bot-read-test.patch)，没有应用到这份副本。
+- 我们的改动是两个补丁，都没有应用到这份副本，要按顺序应用：先 [只读测试补丁](patches/wechat4-vision-bot-read-test.patch)，再 [RapidOCR 补丁](patches/wechat4-vision-bot-rapidocr.patch)。
 - `watcher.py` 负责轮询检测和调度，`reply.py` 负责打开会话、读消息和发送，`genreply.py` 调模型，`sendguard.py` 是发送护栏。watcher 每次读或发都会新起一个 `reply.py` 子进程。
 
 ## 当前状态
@@ -17,6 +17,11 @@ CowAgent 的 `weixin` 通道只收私聊（[weixin_message.py](../../channel/wei
   - 只读流程失败时返回非零退出码，收尾不再按 Esc。
 - 离线回归覆盖 100% 缩放下的「最常使用」和 125% 缩放下的「群聊」。
 - 虚拟机之后做了显卡直通，显示输出可能已变化。补丁只在原布局下验证过，需要重跑只读测试。
+- RapidOCR 补丁只在 Mac 上做过语法检查和桩测试，没有在虚拟机跑过。默认引擎仍是 Tesseract，应用后识别行为不变。它做了这些事：
+  - 新增 `ocr_engine.py`。`config.json` 的 `ocr.engine` 选 `tesseract` 或 `rapidocr`，环境变量 `WECHAT4_OCR_ENGINE` 可临时覆盖。所有 OCR 调用点都经过它。
+  - RapidOCR 在进程内运行，每个进程只加载一次模型。每个区域只用原色图跑一遍，不做 Tesseract 需要的放大、反色、多 PSM 和绿字掩膜。
+  - `reply.py --read-msg` 输出的 JSON 增加 `timing`（OCR、模型加载、界面等待、截图、其余各占多少毫秒）和 `scale`。加 `--save-shot` 会把整窗截图存到 `screenshots\`。
+  - 新增 `tools/ocr_bench.py`：在截图上逐个引擎对比识别结果和耗时，每个引擎单独起一个进程，第一张图的耗时包含模型加载。
 - 视觉模型生成、自动发送、图片视频、任务结果回传都还没验证。
 
 ## 截图路线的固有限制
@@ -31,16 +36,13 @@ CowAgent 的 `weixin` 通道只收私聊（[weixin_message.py](../../channel/wei
 
 已排除改写成 C 或 C#、用显卡跑 OCR 两个方向。耗时主要来自界面等待、每次识别都启动一次 `tesseract.exe` 并重新加载模型、同一区域多遍识别，换语言或上显卡都解决不了这些。
 
-1. 用虚拟机只读日志里各阶段的时间戳，算出 OCR、等待和界面操作各占多少耗时。
-2. 宿主机是 fnOS，没查到它的虚拟机界面是否提供 CPU 直通选项。可以在宿主机查看 qemu 进程的 `-cpu` 参数，`host` 表示已直通。改好后在虚拟机运行 `tesseract --version`，输出应有 `Found AVX2` 和 `Found FMA`，再重跑只读测试对比耗时。
-3. 在 Python 里把 Tesseract 换成 RapidOCR + PP-OCRv5 轻量版，用 CPU 版 `onnxruntime`。需要改的调用点：
-   - `watcher.py`：[`_tess_run`](../../third_party/wechat4-vision-bot/watcher.py#L1160)、`_ocr_row_name_candidates`、`_ocr_row_preview`。
-   - `reply.py`：`ocr_candidates`、`_ocr_tsv_lines`、`_ocr_words`、`_ocr_row_text_psm7`、`_ocr_bubble_text_precise`，以及补丁新增的 `ocr_chat_title`。
-
-   现有的放大、多 PSM、反色和匹配阈值都是按 Tesseract 调的，替换后要重新标定。
-4. 替换前先做离线对比：用同一批失败截图、同样的裁剪区域，分别记录两种引擎的识别结果、首次调用耗时和后续平均耗时。每次读取都是新起的 `reply.py` 进程，模型首次加载的时间也会计入每次读取。
-5. 收发跑通后再配置视觉模型。在 `.credentials.json` 填 `baseUrl`、模型 ID 和 API Key，接口需要接受 `image_url`。运行 `watcher.py --vision-test --chat "Test"`，看 `gen.text` 和 `gen.latencyMs`。默认超时 25 秒，输出上限 120 tokens。Qwen3.8-27B 部署在哪台机器还没定，要确认能在超时内返回。
-6. 接回 CowAgent 时：
+1. 测基线：在虚拟机应用两个补丁，保持 Tesseract，运行 `reply.py --read-msg --chat "Test" --save-shot`。记下 `timing`、`scale` 和截图路径。日志时间戳只精确到秒，拆分耗时以 `timing` 为准。
+2. 宿主机是 fnOS，没查到它的虚拟机界面是否提供 CPU 直通选项。可以在宿主机查看 qemu 进程的 `-cpu` 参数，`host` 表示已直通。改好后在虚拟机运行 `tesseract --version`，输出应有 `Found AVX2` 和 `Found FMA`，再重跑第 1 步对比耗时。
+3. 离线安装 RapidOCR：在机器人目录执行 `uv pip install --offline --no-index --find-links <wheel目录> --python .venv\Scripts\python.exe -r requirements-rapidocr.txt --overrides overrides-rapidocr.txt`。必须带上 overrides 文件，否则会多装一份 `opencv-python-headless`，和现有的 `opencv-python` 抢 `cv2`。wheel 目录用 `uv pip compile --python-platform windows --python-version 3.12` 解析同样两个文件后，逐个从 PyPI 下载。rapidocr 的 wheel 自带 PP-OCRv6 small。PP-OCRv5 mobile 和 PP-OCRv6 tiny 从 RapidOCR v3.10.0 模型仓库下载，放到 `models\`。
+4. 离线对比：`.venv\Scripts\python.exe tools\ocr_bench.py --variants tesseract,rapidocr,v5mobile,v6tiny --scale <scale> screenshots\*-read.png`。看识别是否正确，再看首张耗时和后续平均耗时。
+5. 选出模型后，把 `ocr.engine` 改成 `rapidocr`，在 `ocr.rapidocr` 里填模型路径，重跑第 1 步，并测一次从其他会话搜索打开。匹配阈值和裁剪区域是按 Tesseract 标定的，识别偏差要在这一步调整。
+6. 收发跑通后再配置视觉模型。在 `.credentials.json` 填 `baseUrl`、模型 ID 和 API Key，接口需要接受 `image_url`。运行 `watcher.py --vision-test --chat "Test"`，看 `gen.text` 和 `gen.latencyMs`。默认超时 25 秒，输出上限 120 tokens。Qwen3.8-27B 部署在哪台机器还没定，要确认能在超时内返回。
+7. 接回 CowAgent 时：
    - 普通对话、编程任务和工作任务分开路由，保留来源群和任务标识。
    - 任务结果需要单独的发送路径，不能走 genreply 的截断。
    - 任务结果和聊天回复排进同一个串行动作队列。
@@ -49,6 +51,6 @@ CowAgent 的 `weixin` 通道只收私聊（[weixin_message.py](../../channel/wei
 
 - 运行条件：微信 4.x Windows 版，桌面保持登录、不锁屏，微信可见且最大化。从 SSH 会话启动的进程看不到桌面。
 - 项目目录是 `C:\WorkPlace\wechat4-vision-bot`，Python 3.12 venv 用 uv 创建，Tesseract 在 PATH 中，装有 `chi_sim`。
-- 虚拟机不能联网下载。依赖要在别处下载 Python 3.12、win_amd64 的 wheel，再用 `uv pip install --offline --no-index --find-links <目录>` 安装；RapidOCR 的模型文件也要提前拷入。
+- 虚拟机不能联网下载。依赖要在别处下载 Python 3.12、win_amd64 的 wheel，再用 `uv pip install --offline --no-index --find-links <目录>` 安装；RapidOCR 的模型文件也要提前拷入。CPU 没直通时虚拟机可能缺 AVX 等指令集，onnxruntime 可能加载失败或很慢，最好先做 CPU 直通再装。
 - 测试入口是 `C:\WorkPlace\cmd\wechat4-vision-test.cmd`：选 `1` 跑 OCR 只读测试，选 `2` 生成视觉模型草稿。日志在同目录的 `wechat4-vision-test-last.log`。
-- 全新部署时，把 `third_party/wechat4-vision-bot` 复制到虚拟机，在该目录执行 `git apply <CowAgent>\docs\ai\patches\wechat4-vision-bot-read-test.patch`。
+- 全新部署时，把 `third_party/wechat4-vision-bot` 复制到虚拟机，在该目录依次 `git apply` 只读测试补丁和 RapidOCR 补丁。
