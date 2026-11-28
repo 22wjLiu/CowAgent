@@ -24,6 +24,12 @@ CowAgent 是一个可通过 Web、桌面端、移动端及即时通信渠道使�
 3. **改 Web API 或 SSE 字段时，核对 Web、桌面端和移动端的调用方。** 会话恢复依赖请求 ID 和事件游标，只更新服务端可能导致旧客户端重放或漏掉消息。见 [客户端与共享协议](docs/ai/clients-and-api.md)。
 4. **改后端依赖或随包资源时，检查桌面 PyInstaller 和移动端内嵌内核的清单。** 根目录能运行的改动仍可能因漏打包而在安装后的客户端失效。见 [客户端与共享协议](docs/ai/clients-and-api.md)。
 
+## 外出工作模式
+
+外出工作时，使用 `ssh liu@fn-virtual-1` 登录 Windows 测试虚拟机。登录后 Windows 显示的主机名为 `Virtual-1`。密码保存在本机 macOS 钥匙串中，服务名为 `CowAgent/ssh/VIRTUAL-1`，账号为 `liu`。
+
+如果 SSH 连接失败，及时向用户反馈具体错误，并请用户检查网络环境。
+
 ## 提交规范
 
 按 [CONTRIBUTING.md](CONTRIBUTING.md) 尽量使用英文撰写 issue、PR、提交说明、代码注释和 docstring。提交与 PR 标题使用简短的祈使句，推荐 Conventional Commits。每个 PR 聚焦一个逻辑改动，描述改动内容与原因。
